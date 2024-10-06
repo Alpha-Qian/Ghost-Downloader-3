@@ -112,7 +112,7 @@ class DownloadTask(QThread):
             if (work.endPos - work.process) // 2 > maxRemain:
                 maxRemain = (work.endPos - work.process)//2
                 maxWorker = work
-        if maxRemain >= 1024*1024:#cfg.maxReassignSize.value * 1048576:#1MB
+        if maxRemain >= cfg.maxReassignSize.value * 1048576:#1MB
             self.__divitionTask((maxWorker.process + maxWorker.endPos)//2)
             logger.info(
                 f'Task{self.fileName} 分配新线程成功, 剩余量：{getReadableSize(maxRemain)}')
