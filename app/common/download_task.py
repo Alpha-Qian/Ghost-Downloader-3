@@ -127,7 +127,7 @@ class DownloadTask(QThread):
             maxRemainderWorker.endPos = maxRemainderWorkerProcess + baseShare + remainder  # 直接修改好像也不会怎么样
 
             # 安配新的工人
-            s_pos = maxRemainderWorkerProcess + baseShare + remainder + 1
+            s_pos = maxRemainderWorkerProcess + baseShare + remainder
 
             newWorker = DownloadWorker(s_pos, s_pos, maxRemainderWorkerEnd, self.client)
 
@@ -156,10 +156,10 @@ class DownloadTask(QThread):
 
         for i in range(len(arr) - 1):  #
 
-            s_pos, e_pos = arr[i], arr[i + 1] - 1
+            s_pos, e_pos = arr[i], arr[i + 1]
             step_list.append([s_pos, e_pos])
 
-        step_list[-1][-1] = self.fileSize - 1  # 修正
+        step_list[-1][-1] = self.fileSize  # 修正
 
         return step_list
 
@@ -222,7 +222,7 @@ class DownloadTask(QThread):
             while not finished:
                 try:
                     download_headers = Headers.copy()
-                    download_headers["range"] = f"bytes={worker.process}-{worker.endPos}"  # 添加范围
+                    download_headers["range"] = f"bytes={worker.process}-{worker.endPos - 1}"  #只是相当于把修正换了个位置，避免影响到切片和进度等的计算
 
                     async with worker.client.stream(url=self.url, headers=download_headers, timeout=30,
                                                     method="GET") as res:
@@ -261,7 +261,7 @@ class DownloadTask(QThread):
             for i in self.workers:
                 info.append({"start": i.startPos, "process": i.process, "end": i.endPos})
 
-                self.process += (i.process - i.startPos + 1)
+                self.process += (i.process - i.startPos)
 
                 # 保存 workers 信息为二进制格式
                 data = struct.pack("<QQQ", i.startPos, i.process, i.endPos)
