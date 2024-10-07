@@ -1,6 +1,7 @@
 import asyncio
 import struct
 import time
+import aiofiles
 from asyncio import Task
 from pathlib import Path
 from threading import Thread
@@ -78,6 +79,7 @@ class DownloadTask(QThread):
         self.fileName = fileName
         self.filePath = filePath
         self.maxBlockNum = maxBlockNum
+        self.fileLock = asyncio.Lock()
         self.workers: list[DownloadWorker] = []
         self.tasks: list[Task] = []
 
@@ -213,8 +215,9 @@ class DownloadTask(QThread):
                             if worker.endPos <= worker.process:
                                 break
                             if chunk:
-                                self.file.seek(worker.process)
-                                self.file.write(chunk)
+                                async with self.fileLock:
+                                    await self.file.seek(worker.process)
+                                    await self.file.write(chunk)
                                 worker.process += 65536
 
                     if worker.process >= worker.endPos:
@@ -260,7 +263,7 @@ class DownloadTask(QThread):
     async def __main(self):
         try:
             # 打开下载文件
-            self.file = open(f"{self.filePath}/{self.fileName}", "rb+")
+            self.file = await aiofiles.open(f"{self.filePath}/{self.fileName}", "rb+")
 
             # 启动 Worker
             for i in self.workers:
@@ -278,15 +281,13 @@ class DownloadTask(QThread):
             try:
                 await self.supervisorTask  # supervisorTask 被 cancel 后，会抛出 CancelledError, 所以之后的代码不会执行
             except asyncio.CancelledError:
+                logger.info('任务被取消咯')
+            finally:
+                # 关闭
+                await self.file.close()
                 await self.client.aclose()
-
-            # 关闭
-            await self.client.aclose()
-
-            self.file.close()
-            self.ghdFile.close()
-
-            print("File closed.")
+                self.ghdFile.close()
+                logger.debug("File closed.")
 
             if self.process == self.fileSize:
                 # 删除历史记录文件
@@ -309,7 +310,6 @@ class DownloadTask(QThread):
 
         # 关闭
         self.supervisorTask.cancel()
-        self.file.close()
         self.ghdFile.close()
 
         while not all(task.done() for task in self.tasks):  # 等待所有任务完成
