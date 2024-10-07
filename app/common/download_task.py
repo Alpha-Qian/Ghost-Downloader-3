@@ -87,64 +87,50 @@ class DownloadTask(QThread):
         self.__tempThread = Thread(target=self.__getLinkInfo, daemon=True)  # TODO 获取文件名和文件大小的线程等信息, 暂时使用线程方式
         self.__tempThread.start()
 
-    def __reassignWorker(self, task: Task):
+    def __reassignWorker(self):
+        '''自动在已有的任务中创建一个新连接'''
 
-        # 找到剩余进度最多的线程
-        maxRemainder = 0
-        maxRemainderWorkerProcess = 0
-        maxRemainderWorkerEnd = 0
-        maxRemainderWorker: DownloadWorker = None
-
-        for i in self.workers:
-            if (i.endPos - i.process) > maxRemainder:  # TODO 其实逻辑有一点问题, 但是影响不大
-                maxRemainderWorkerProcess = i.process
-                maxRemainderWorkerEnd = i.endPos
-                maxRemainder = (maxRemainderWorkerEnd - maxRemainderWorkerProcess)
-                maxRemainderWorker = i
-
-        if maxRemainderWorker and maxRemainder > cfg.maxReassignSize.value * 1048576:  # 转换成 MB
-            # 平均分配工作量
-            baseShare = maxRemainder // 2
-            remainder = maxRemainder % 2
-
-            maxRemainderWorker.endPos = maxRemainderWorkerProcess + baseShare + remainder  # 直接修改好像也不会怎么样
-
-            # 安配新的工人
-            s_pos = maxRemainderWorkerProcess + baseShare + remainder + 1
-
-            newWorker = DownloadWorker(s_pos, s_pos, maxRemainderWorkerEnd, self.client)
-
-            newTask = self.loop.create_task(self.__handleWorker(newWorker))
-            newTask.add_done_callback(self.__reassignWorker)
-
-            self.workers.insert(self.workers.index(maxRemainderWorker) + 1, newWorker)
-            self.tasks.append(newTask)
-
+        maxRemain = 0
+        for work in self.workers:
+            if (work.endPos - work.process) // 2 > maxRemain:
+                maxRemain = (work.endPos - work.process)//2
+                maxWorker = work
+        if maxRemain >= cfg.maxReassignSize.value * 1048576:#1MB
+            self.__divitionTask((maxWorker.process + maxWorker.endPos)//2)
             logger.info(
-                f"Task{self.fileName} 分配新线程成功, 剩余量：{getReadableSize(maxRemainder)}，修改后的EndPos：{maxRemainderWorker.endPos}，新线程：{newWorker}，新线程的StartPos：{s_pos}")
-
+                f'Task{self.fileName} 分配新线程成功, 剩余量：{getReadableSize(maxRemain)}')
         else:
             logger.info(
-                f"Task{self.fileName} 欲分配新线程失败, 剩余量小于最小分块大小, 剩余量：{getReadableSize(maxRemainder)}")
+                f"Task{self.fileName} 欲分配新线程失败, 剩余量小于最小分块大小, 剩余量：{getReadableSize(maxRemain)}")
+            
+    def __clacDivisionalRange(self) -> None:
+        block_size = self.fileSize // self.maxBlockNum
+        if self.maxBlockNum != 0:
+            for i in range(0, self.fileSize - self.maxBlockNum, block_size):#你就说这个算法妙不妙吧
+                self.__divitionTask(i)
+    
 
-    def __clacDivisionalRange(self):
-        step = self.fileSize // self.maxBlockNum  # 每块大小
-        arr = list(range(0, self.fileSize, step))
+    def __divitionTask(self, startPos:int):
+        '''自动根据开始位置创建新任务,底层API'''
+        if len(self.workers) > 0 and startPos < self.workers[-1].endPos:
+            match = False
+            for block in self.workers:
+                if block.process < startPos < block.endPos:
+                    match = True
+                    task_block = DownloadWorker(startPos, startPos, block.endPos, self.client) #分割
+                    block.endPos = startPos
+                    self.workers.insert(self.workers.index(block)+1,task_block)
+                    break
+            if not match:
+                raise Exception('未定义的行为，通常是重复下载导致的')
+        else:
+            task_block = DownloadWorker(startPos, startPos, self.fileSize, self.client)
+            self.workers.append(task_block)
+        
+        _ = asyncio.create_task(self.__handleWorker(task_block))
+        self.tasks.append(_)
 
-        # 否则线程数可能会不按预期地少一个
-        if self.fileSize % self.maxBlockNum == 0:
-            arr.append(self.fileSize)
-
-        step_list = []
-
-        for i in range(len(arr) - 1):  #
-
-            s_pos, e_pos = arr[i], arr[i + 1] - 1
-            step_list.append([s_pos, e_pos])
-
-        step_list[-1][-1] = self.fileSize - 1  # 修正
-
-        return step_list
+        #self.task_group.create_task(self.download(task_block))
 
     def __getLinkInfo(self):
         try:
@@ -170,11 +156,12 @@ class DownloadTask(QThread):
             self.gotWrong.emit(str(e))
 
     def __loadWorkers(self):
+        #只能在创建事件循环后调用
         # 如果 .ghd 文件存在，读取并解析二进制数据
-        filePath = Path(f"{self.filePath}/{self.fileName}.ghd")
-        if filePath.exists():
+        ghdFilePath = Path(f"{self.filePath}/{self.fileName}.ghd")
+        if ghdFilePath.exists():
             try:
-                with open(filePath, "rb") as f:
+                with open(ghdFilePath, "rb") as f:
                     while True:
                         data = f.read(24)  # 每个 worker 有 3 个 64 位的无符号整数，共 24 字节
 
@@ -184,20 +171,19 @@ class DownloadTask(QThread):
                         start, process, end = struct.unpack("<QQQ", data)
                         self.workers.append(
                             DownloadWorker(start, process, end, self.client))
+                    # 启动 Worker
+                    for i in self.workers:
+                        logger.debug(f"Task {self.fileName}, starting the thread {i}...")
+
+                        _ = asyncio.create_task(self.__handleWorker(i))
+                        self.tasks.append(_)
 
             except Exception as e:
                 logger.error(f"Failed to load workers: {e}")
-                stepList = self.__clacDivisionalRange()
-
-                for i in range(self.maxBlockNum):
-                    self.workers.append(
-                        DownloadWorker(stepList[i][0], stepList[i][0], stepList[i][1], self.client))
+                self.__clacDivisionalRange()
         else:
-            stepList = self.__clacDivisionalRange()
+            self.__clacDivisionalRange()
 
-            for i in range(self.maxBlockNum):
-                self.workers.append(
-                    DownloadWorker(stepList[i][0], stepList[i][0], stepList[i][1], self.client))
 
     async def __handleWorker(self, worker: DownloadWorker):
         if worker.process < worker.endPos:  # 因为可能会创建空线程
@@ -205,7 +191,7 @@ class DownloadTask(QThread):
             while not finished:
                 try:
                     download_headers = Headers.copy()
-                    download_headers["range"] = f"bytes={worker.process}-{worker.endPos}"  # 添加范围
+                    download_headers["range"] = f"bytes={worker.process}-{worker.endPos - 1}"  #只是相当于把修正换了个位置，避免影响到切片和进度等的计算
 
                     async with worker.client.stream(url=self.url, headers=download_headers, timeout=30,
                                                     method="GET") as res:
@@ -231,6 +217,8 @@ class DownloadTask(QThread):
                     await asyncio.sleep(5)
 
             worker.process = worker.endPos
+            self.__reassignWorker()
+            #房这里除了出错不会执行外和使用回调没区别，但用了try就没什么问题。给使用TaskGroup的回调留位置
 
     async def __supervisor(self):
         """实时统计进度并写入历史记录文件"""
@@ -244,7 +232,7 @@ class DownloadTask(QThread):
             for i in self.workers:
                 info.append({"start": i.startPos, "process": i.process, "end": i.endPos})
 
-                self.process += (i.process - i.startPos + 1)
+                self.process += (i.process - i.startPos)
 
                 # 保存 workers 信息为二进制格式
                 data = struct.pack("<QQQ", i.startPos, i.process, i.endPos)
@@ -258,18 +246,14 @@ class DownloadTask(QThread):
             await asyncio.sleep(1)
 
     async def __main(self):
+        # 加载分块
+        self.__loadWorkers()
+
         try:
             # 打开下载文件
             self.file = open(f"{self.filePath}/{self.fileName}", "rb+")
 
-            # 启动 Worker
-            for i in self.workers:
-                logger.debug(f"Task {self.fileName}, starting the thread {i}...")
-
-                _ = asyncio.create_task(self.__handleWorker(i))
-                _.add_done_callback(self.__reassignWorker)
-
-                self.tasks.append(_)
+            
 
             self.ghdFile = open(f"{self.filePath}/{self.fileName}.ghd", "wb")
             self.supervisorTask = asyncio.create_task(self.__supervisor())
@@ -326,10 +310,11 @@ class DownloadTask(QThread):
         if not self.ableToParallelDownload:
             self.maxBlockNum = 1
 
-        # 加载分块
-        self.__loadWorkers()
-
         # 主逻辑, 使用事件循环启动异步任务
+        asyncio.run(self.__main())
+        return
+        #self.loop = asyncio.get_running_loop()
+        
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
