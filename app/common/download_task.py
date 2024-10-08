@@ -211,7 +211,7 @@ class DownloadTask(QThread):
 
                     finished = True
 
-                except Exception as e:
+                except httpx.HTTPError as e:
                     logger.info(
                         f"Task: {self.fileName}, Thread {worker} is reconnecting to the server, Error: {repr(e)}")
 
@@ -220,8 +220,7 @@ class DownloadTask(QThread):
                     await asyncio.sleep(5)
 
             worker.process = worker.endPos
-            self.__reassignWorker()
-            #房这里除了出错不会执行外和使用回调没区别，但用了try就没什么问题。给使用TaskGroup的回调留位置
+        self.__reassignWorker()
 
     async def __supervisor(self):
         """实时统计进度并写入历史记录文件"""
