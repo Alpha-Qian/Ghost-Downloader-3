@@ -330,8 +330,15 @@ class DownloadTask(QThread):
                         duringTime = 0
 
                         speedPerConnect = avgSpeed / len(self.tasks)
+                        #maxSpeedPerConnect被限制在（speedPerConnect, avgSpeed）之间
                         if speedPerConnect > maxSpeedPerConnect:
                             maxSpeedPerConnect = speedPerConnect
+                            _ = (0.85 * maxSpeedPerConnect * additionalTaskNum) + formerAvgSpeed
+
+                        elif avgSpeed < maxSpeedPerConnect:#如果avgSpeed < maxSpeedPerConnect，则视为网络环境发生变化，更新maxSpeedPerConnect的值
+                            #如果多线程的速度都达不到单线程最大速度，说明单线程最大速度偏高，不过可能会导致重复重置maxSpeedPerConnect
+                            logger.debug(f"网络环境发生变化，avgSpeed{avgSpeed}")
+                            maxSpeedPerConnect = avgSpeed
                             _ = (0.85 * maxSpeedPerConnect * additionalTaskNum) + formerAvgSpeed
 
                         # if maxSpeedPerConnect <= 1:
