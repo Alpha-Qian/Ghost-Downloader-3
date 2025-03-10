@@ -2,14 +2,13 @@
 import sys
 from re import compile
 
-from PySide6.QtCore import QDir, QRect
+from PySide6.QtCore import QRect, QStandardPaths
 from qfluentwidgets import (QConfig, ConfigItem, OptionsConfigItem, BoolValidator,
                             OptionsValidator, RangeConfigItem, RangeValidator,
-                            FolderValidator, ConfigValidator, ConfigSerializer)
+                            FolderValidator, ConfigValidator, ConfigSerializer, FolderListValidator)
 
 
 class ProxyValidator(ConfigValidator):
-
     PATTERN = compile(r'^(socks5|http|https):\/\/'
                       r'((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
                       r'(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?):'
@@ -23,6 +22,7 @@ class ProxyValidator(ConfigValidator):
     def correct(self, value) -> str:
         return value if self.validate(value) else "Auto"
 
+
 class GeometryValidator(ConfigValidator):  # geometry 为程序的位置和大小, 保存为字符串 "x,y,w,h," 默认为 Default
     def validate(self, value: QRect) -> bool:
         if value == "Default":
@@ -32,6 +32,7 @@ class GeometryValidator(ConfigValidator):  # geometry 为程序的位置和大�
 
     def correct(self, value) -> str:
         return value if self.validate(value) else "Default"
+
 
 class GeometrySerializer(ConfigSerializer):  # 将字符串 "x,y,w,h," 转换为QRect (x, y, w, h), "Default" 除外
     def serialize(self, value: QRect) -> str:
@@ -45,12 +46,14 @@ class GeometrySerializer(ConfigSerializer):  # 将字符串 "x,y,w,h," 转换为
         x, y, w, h = map(int, value.split(","))
         return QRect(x, y, w, h)
 
+
 class Config(QConfig):
     """ Config of application """
     # download
     maxReassignSize = RangeConfigItem("Download", "MaxReassignSize", 8, RangeValidator(1, 100))
     downloadFolder = ConfigItem(
-        "Download", "DownloadFolder", QDir.currentPath(), FolderValidator())
+        "Download", "DownloadFolder", QStandardPaths.writableLocation(QStandardPaths.DownloadLocation), FolderValidator())
+    historyDownloadFolder = ConfigItem("Download", "HistoryDownloadFolder", [], FolderListValidator())
 
     preBlockNum = RangeConfigItem("Download", "PreBlockNum", 8, RangeValidator(1, 256))
     maxTaskNum = RangeConfigItem("Download", "MaxTaskNum", 3, RangeValidator(1, 10))
@@ -63,8 +66,10 @@ class Config(QConfig):
 
     # personalization
     if sys.platform == "win32":
-        backgroundEffect = OptionsConfigItem("Personalization", "BackgroundEffect", "Mica", OptionsValidator(["Acrylic", "Mica", "MicaBlur", "MicaAlt", "Aero", "None"]))
-    customThemeMode = OptionsConfigItem("Personalization", "ThemeMode", "System", OptionsValidator(["Light", "Dark", "System"]))
+        backgroundEffect = OptionsConfigItem("Personalization", "BackgroundEffect", "Mica", OptionsValidator(
+            ["Acrylic", "Mica", "MicaBlur", "MicaAlt", "Aero", "None"]))
+    customThemeMode = OptionsConfigItem("Personalization", "ThemeMode", "System",
+                                        OptionsValidator(["Light", "Dark", "System"]))
     dpiScale = RangeConfigItem(
         "Personalization", "DpiScale", 0, RangeValidator(0, 5), restart=True)
 
@@ -72,7 +77,8 @@ class Config(QConfig):
     checkUpdateAtStartUp = ConfigItem("Software", "CheckUpdateAtStartUp", True, BoolValidator())
     autoRun = ConfigItem("Software", "AutoRun", False, BoolValidator())
     enableClipboardListener = ConfigItem("Software", "ClipboardListener", True, BoolValidator())
-    geometry = ConfigItem("Software", "Geometry", "Default", GeometryValidator(), GeometrySerializer())  # 保存程序的位置和大小, Validator 在 mainWindow 中设置
+    geometry = ConfigItem("Software", "Geometry", "Default", GeometryValidator(),
+                          GeometrySerializer())  # 保存程序的位置和大小, Validator 在 mainWindow 中设置
 
     # 全局变量
     appPath = "./"
@@ -81,9 +87,10 @@ class Config(QConfig):
     def resetGlobalSpeed(self):
         self.globalSpeed = 0
 
+
 YEAR = 2025
 AUTHOR = "XiaoYouChR"
-VERSION = "3.5.2"
+VERSION = "3.5.3"
 LATEST_EXTENSION_VERSION = "1.1.1"
 AUTHOR_URL = "https://space.bilibili.com/437313511"
 FEEDBACK_URL = "https://github.com/XiaoYouChR/Ghost-Downloader-3/issues"
