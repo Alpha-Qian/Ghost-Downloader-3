@@ -40,7 +40,6 @@ class DownloadTask(QThread):
     def __init__(self, url, headers, preTaskNum: int = 8, filePath:str=None, fileName:str=None, autoSpeedUp:bool=False, fileSize:int=-1, parent=None):
         super().__init__(parent)
 
-        self.aioLock = asyncio.Lock()
         self.progress = 0
         self.url = url
         self.headers = headers
@@ -207,6 +206,9 @@ class DownloadTask(QThread):
         logger.debug(f"{self.fileName} task is launching the worker {worker.startPos}-{worker.endPos}...")
         if worker.progress < worker.endPos:  # 因为可能会创建空线程
             finished = False
+            file = await aiofiles.open(f"{self.filePath}/{self.fileName}", "rb+")
+            await file.seek(worker.startPos)
+            
             while not finished:
                 try:
                     workingRangeHeaders = self.headers.copy()
@@ -221,15 +223,13 @@ class DownloadTask(QThread):
                             if worker.endPos <= worker.progress:
                                 break
                             if chunk:
-                                async with self.aioLock:
-                                    await self.file.seek(worker.progress)
-                                    await self.file.write(chunk)
-                                    _ = len(chunk)
-                                    worker.progress += _
-                                    cfg.globalSpeed += _
-                                    if cfg.speedLimitation.value:
-                                        if cfg.globalSpeed >= cfg.speedLimitation.value:
-                                            await asyncio.sleep(1)  # 在锁里面睡，只阻塞 worker, 不阻塞 supervisor
+                                await file.write(chunk)
+                                _ = len(chunk)
+                                worker.progress += _
+                                cfg.globalSpeed += _
+                                if cfg.speedLimitation.value:
+                                    if cfg.globalSpeed >= cfg.speedLimitation.value:
+                                        await asyncio.sleep(1)  # 在锁里面睡，只阻塞 worker, 不阻塞 supervisor
                             else:
                                 raise httpx.HTTPStatusError("服务器返回空数据")
 
@@ -253,6 +253,7 @@ class DownloadTask(QThread):
     async def __handleWorkerWhenUnableToParallelDownload(self, worker: DownloadWorker):
         if worker.progress < worker.endPos:  # 因为可能会创建空线程
             finished = False
+            file = await aiofiles.open(f"{self.filePath}/{self.fileName}", "rb+")
             while not finished:
                 try:
                     WorkingRangeHeaders = self.headers.copy()
@@ -261,8 +262,7 @@ class DownloadTask(QThread):
                         async for chunk in res.aiter_bytes():
 
                             if chunk:
-                                await self.file.seek(worker.progress)
-                                await self.file.write(chunk)
+                                await file.write(chunk)
                                 _ = len(chunk)
                                 worker.progress += _
                                 cfg.globalSpeed += _
@@ -389,7 +389,7 @@ class DownloadTask(QThread):
     async def __main(self):
         try:
             # 打开下载文件
-            self.file = await aiofiles.open(f"{self.filePath}/{self.fileName}", "rb+")
+            #self.file = await aiofiles.open(f"{self.filePath}/{self.fileName}", "rb+")
 
             if self.ableToParallelDownload:
                 for i in self.workers:  # 启动 Worker
@@ -414,7 +414,7 @@ class DownloadTask(QThread):
             # 关闭
             await self.client.aclose()
 
-            await self.file.close()
+            #await self.file.close()
 
             if self.fileSize:  # 事实上表示 ableToParallelDownload 为 False
                 await self.ghdFile.close()
