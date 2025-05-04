@@ -247,6 +247,7 @@ class DownloadTask(QThread):
                     await asyncio.sleep(5)  # 5s 后重试
 
             worker.progress = worker.endPos
+            await file.close()
 
         self.__reassignWorker()
 
@@ -283,6 +284,7 @@ class DownloadTask(QThread):
                     await asyncio.sleep(5)
 
             worker.progress = worker.endPos
+            await file.close()
 
     async def __supervisor(self):
         """实时统计进度并写入历史记录文件"""
@@ -413,6 +415,7 @@ class DownloadTask(QThread):
 
             # 关闭
             await self.client.aclose()
+            asyncio.get_running_loop().run_in_executor
 
             #await self.file.close()
 
