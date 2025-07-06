@@ -221,7 +221,7 @@ class DownloadTask(QThread):
         self.downloadStrategy = None
 
         # Speed tracking
-        self.historyProgress = deque([self.progress] * 10)  # Rolling window of 10 seconds for speed calculation
+        self.historyProgress = deque(maxlen = 10)  # Rolling window of 10 seconds for speed calculation
 
         # HTTP client setup
         proxy = getProxy()
@@ -713,6 +713,12 @@ class DownloadTask(QThread):
         # Load or create workers
         self.__loadWorkers()
 
+        # Calculate total progress
+        self.progress = 0
+        for worker in self.workers:
+            self.progress += worker.progress - worker.startPos
+        self.historyProgress = deque([self.progress] * 10, maxlen = 10)
+        
         # Create and configure event loop
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
