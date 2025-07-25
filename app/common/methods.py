@@ -240,8 +240,6 @@ def getLocalTimeFromGithubApiTime(gmtTimeStr: str):
 #                 winreg.SetValueEx(masterKey, "IconUri", 0, winreg.REG_SZ, str(iconPath.resolve()))
 #     except Exception as e:
 #         logger.error(f"Could not register the application: {e}")
-
-
 def getLinkInfo(
     url: str,
     headers: dict,
@@ -265,10 +263,17 @@ def getLinkInfo(
         impersonate="chrome",
     )
     response.raise_for_status()  # 如果状态码不是 2xx，抛出异常
+    return getLinkInfoFromResponse(response, fileName)
 
+
+def getLinkInfoFromResponse(
+    response: curl_cffi.Response,
+    fileName: str = "",
+) -> tuple:
+    """发送response的请求必须携带Range: bytes=0- 头部"""
+    
     head = response.headers
-
-    url = str(response.url)
+    url = response.url
 
     # 获取文件大小, 判断是否可以分块下载
     # 状态码为206才是范围请求，200表示服务器拒绝了范围请求同时将发送整个文件

@@ -2,16 +2,17 @@ import asyncio
 import struct
 import sys
 import time
-from asyncio import Task
+from asyncio import Task,Event
 from pathlib import Path
 from threading import Thread
+from contextlib import asynccontextmanager, contextmanager
 
 import curl_cffi
 from PySide6.QtCore import QThread, Signal
 from loguru import logger
 
 from app.common.config import cfg
-from app.common.methods import getProxy, getReadableSize, getLinkInfo, createSparseFile
+from app.common.methods import getProxy, getReadableSize, getLinkInfo, createSparseFile, getLinkInfoFromResponse
 
 
 class DownloadWorker:
@@ -23,6 +24,20 @@ class DownloadWorker:
         self.endPos = end
 
         self.client = client
+
+
+class MutiThreadContext:
+    """多线程句柄，如果DownloadTask的方法需要使用多线程，则需要将该类作为参数传入"""
+    def __init__(self, fileSize):
+        self.workers: list[DownloadWorker] = []
+        self.taskgroup = asyncio.TaskGroup()
+        self.created:int = 0
+        self.done:int = 0
+        self.fileSize:int = fileSize
+
+    @property
+    def running_task_num(self):
+        return self.created - self.done
 
 
 class DownloadTask(QThread):
@@ -47,6 +62,7 @@ class DownloadTask(QThread):
         fileName: str = None,
         autoSpeedUp: bool = False,
         fileSize: int = -1,
+        resumeInfo: dict | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -61,9 +77,10 @@ class DownloadTask(QThread):
         self.fileSize = fileSize
         self.ableToParallelDownload: bool
 
-        self.workers: list[DownloadWorker] = []
-        self.tasks: list[Task] = []
         self.historySpeed = [0] * 10  # 历史速度 10 秒内的平均速度
+        self.inited = Event()
+        self.firstWorkerCountinue = Event()
+        self.resumeInfo = resumeInfo
 
         proxy = getProxy()
 
@@ -78,12 +95,8 @@ class DownloadTask(QThread):
             http_version="v3",
         )
 
-        self.__initThread = Thread(
-            target=self.__initTask, daemon=True
-        )  # TODO 获取文件名和文件大小的线程等信息, 暂时使用线程方式
-        self.__initThread.start()
 
-    def __reassignWorker(self):
+    def __reassignWorker(self, context: MutiThreadContext):
 
         # 找到剩余进度最多的线程
         maxRemainder = 0
@@ -91,7 +104,7 @@ class DownloadTask(QThread):
         maxRemainderWorkerEnd = 0
         maxRemainderWorker: DownloadWorker = None
 
-        for i in self.workers:
+        for i in context.workers:
             if (
                 i.endPos - i.progress
             ) > maxRemainder:  # 其实逻辑有一点问题, 但是影响不大
@@ -118,10 +131,8 @@ class DownloadTask(QThread):
                 startPos, startPos, maxRemainderWorkerEnd, self.client
             )
 
-            newTask = self.loop.create_task(self.__handleWorker(newWorker))
-
-            self.workers.insert(self.workers.index(maxRemainderWorker) + 1, newWorker)
-            self.tasks.append(newTask)
+            context.taskgroup.create_task(self.__handleWorker(newWorker, context))
+            context.workers.insert(context.workers.index(maxRemainderWorker) + 1, newWorker)
 
             logger.info(
                 f"Task{self.fileName} 分配新线程成功, 剩余量：{getReadableSize(maxRemainder)}，修改后的EndPos：{maxRemainderWorker.endPos}，新线程：{newWorker}，新线程的StartPos：{startPos}"
@@ -132,7 +143,7 @@ class DownloadTask(QThread):
                 f"Task{self.fileName} 欲分配新线程失败, 剩余量小于最小分块大小, 剩余量：{getReadableSize(maxRemainder)}"
             )
 
-    def __calcDivisionalRange(self):
+    def __calcDivisionalRange(self, context: MutiThreadContext):
         step = self.fileSize // self.preBlockNum  # 每块大小
         arr = list(range(0, self.fileSize, step))
 
@@ -151,13 +162,11 @@ class DownloadTask(QThread):
 
         return stepList
 
-    def __initTask(self):
+    def __initTask(self, response):
         """获取链接信息并初始化线程"""
         try:
             if self.fileSize == -1 or not self.fileName:
-                self.url, self.fileName, self.fileSize = getLinkInfo(
-                    self.url, self.headers, self.fileName
-                )
+                self.url, self.fileName, self.fileSize = getLinkInfoFromResponse(response)
 
             if self.fileSize:
                 self.ableToParallelDownload = True
@@ -200,11 +209,7 @@ class DownloadTask(QThread):
         except Exception as e:  # 重试也没用
             self.gotWrong.emit(repr(e))
 
-    def __loadWorkers(self):
-        if not self.ableToParallelDownload:
-            # 如果无法并行下载，创建一个单线程的 worker
-            self.workers.append(DownloadWorker(0, 0, 1, self.client))
-            return
+    def __loadWorkers(self, context: MutiThreadContext):
 
         # 如果 .ghd 文件存在，读取并解析二进制数据
         filePath = Path(f"{self.filePath}/{self.fileName}.ghd")
@@ -220,16 +225,16 @@ class DownloadTask(QThread):
                             break
 
                         start, process, end = struct.unpack("<QQQ", data)
-                        self.workers.append(
+                        context.workers.append(
                             DownloadWorker(start, process, end, self.client)
                         )
 
             except Exception as e:
                 logger.error(f"Failed to load workers: {e}")
-                stepList = self.__calcDivisionalRange()
+                stepList = self.__calcDivisionalRange(context)
 
                 for i in range(self.preBlockNum):
-                    self.workers.append(
+                    context.workers.append(
                         DownloadWorker(
                             stepList[i][0], stepList[i][0], stepList[i][1], self.client
                         )
@@ -244,8 +249,8 @@ class DownloadTask(QThread):
                     )
                 )
 
-    # 主下载逻辑
-    async def __handleWorker(self, worker: DownloadWorker):
+    # 多线程主下载逻辑
+    async def __handleWorker(self, worker: DownloadWorker, context: MutiThreadContext):
         logger.debug(
             f"{self.fileName} task is launching the worker {worker.startPos}-{worker.endPos}..."
         )
@@ -253,38 +258,8 @@ class DownloadTask(QThread):
             finished = False
             while not finished:
                 try:
-                    workingRangeHeaders = self.headers.copy()
-
-                    workingRangeHeaders["range"] = (
-                        f"bytes={worker.progress}-{worker.endPos}"  # 添加范围
-                    )
-
-                    async with worker.client.stream(
-                        url=self.url,
-                        headers=workingRangeHeaders,
-                        timeout=30,
-                        method="GET",
-                    ) as res:
-                        res.raise_for_status()
-                        if res.status_code != 206:
-                            raise Exception(
-                                f"服务器拒绝了范围请求，状态码：{res.status_code}"
-                            )
-                        async for chunk in res.aiter_content():
-                            if worker.endPos <= worker.progress:
-                                break
-                            if chunk:
-                                self.file.seek(worker.progress)
-                                self.file.write(chunk)
-                                chunkSize = len(chunk)
-                                worker.progress += chunkSize
-                                cfg.globalSpeed += chunkSize
-                                if cfg.speedLimitation.value:
-                                    if cfg.globalSpeed >= cfg.speedLimitation.value:
-                                        time.sleep(1)
-
-                    if worker.progress >= worker.endPos:
-                        worker.progress = worker.endPos
+                    response_context = self.get_partical_response(worker)
+                    await self._write_in_file(response_context, worker)
 
                     finished = True
 
@@ -299,33 +274,13 @@ class DownloadTask(QThread):
 
             worker.progress = worker.endPos
 
-    async def __handleWorkerWhenUnableToParallelDownload(self, worker: DownloadWorker):
+    async def __handleFirstWorker(self, worker: DownloadWorker, response: curl_cffi.Response):
         if worker.progress < worker.endPos:  # 因为可能会创建空线程
             finished = False
             while not finished:
                 try:
-                    WorkingRangeHeaders = self.headers.copy()
-                    async with worker.client.stream(
-                        url=self.url,
-                        headers=WorkingRangeHeaders,
-                        timeout=30,
-                        method="GET",
-                    ) as res:
-                        res.raise_for_status()
-                        async for chunk in res.aiter_content():
-                            if chunk:
-                                self.file.seek(worker.progress)
-                                self.file.write(chunk)
-                                _ = len(chunk)
-                                worker.progress += _
-                                cfg.globalSpeed += _
-                                if cfg.speedLimitation.value:
-                                    if cfg.globalSpeed >= cfg.speedLimitation.value:
-                                        time.sleep(1)
-
-                    self.ableToParallelDownload = True  # 事实上用来表示任务已经完成
-
-                    finished = True
+                    response = self.get_first_worker_response()
+                    await self._write_in_file(response, worker)
 
                 except Exception as e:
                     logger.info(
@@ -338,25 +293,42 @@ class DownloadTask(QThread):
 
             worker.progress = worker.endPos
 
-    async def __supervisor(self):
+    async def _write_in_file(self, response, worker: DownloadWorker):
+        try:
+            async for chunk in response.aiter_content():
+                if worker.endPos <= worker.progress:
+                    break
+                if chunk:
+                    self.file.seek(worker.progress)
+                    self.file.write(chunk)
+                    chunkSize = len(chunk)
+                    worker.progress += chunkSize
+                    cfg.globalSpeed += chunkSize
+                    if cfg.speedLimitation.value:
+                        if cfg.globalSpeed >= cfg.speedLimitation.value:
+                            time.sleep(1)
+            if worker.progress >= worker.endPos:
+                worker.progress = worker.endPos
+        finally:
+            await response.aclose()
+
+    async def __supervisor(self, context: MutiThreadContext):
         """实时统计进度并写入历史记录文件"""
         LastProgress = (
             0  # 可能会出现unbound error，所以将LastProgress提取为函数全局变量
         )
 
-        for i in self.workers:
+        for i in context.workers:
             self.progress += i.progress - i.startPos + 1
             LastProgress = self.progress
-
-        if self.ableToParallelDownload:
-            if self.autoSpeedUp:
-                # 初始化变量
-                maxSpeedPerConnect = 1  # 防止除以 0
-                additionalTaskNum = len(self.tasks)  # 最初为计算每个线程的平均速度
-                formerAvgSpeed = 0  # 提速之前的平均速度
-                duringTime = 0  # 计算平均速度的时间间隔, 为 10 秒
-                _ = 0
-
+        if self.autoSpeedUp:
+            # 初始化变量
+            maxSpeedPerConnect = 1  # 防止除以 0
+            additionalTaskNum = context.running_task_num  # 最初为计算每个线程的平均速度
+            formerAvgSpeed = 0  # 提速之前的平均速度
+            duringTime = 0  # 计算平均速度的时间间隔, 为 10 秒
+            _ = 0
+        async with asyncio.TaskGroup() as self.taskGroup:
             while not self.progress == self.fileSize:
 
                 info = []
@@ -364,7 +336,7 @@ class DownloadTask(QThread):
                 self.ghdFile.seek(0)
                 self.progress = 0
 
-                for i in self.workers:
+                for i in context.workers:
                     info.append(
                         {"start": i.startPos, "progress": i.progress, "end": i.endPos}
                     )
@@ -398,7 +370,7 @@ class DownloadTask(QThread):
                     else:
                         duringTime = 0
 
-                        speedPerConnect = avgSpeed / len(self.tasks)
+                        speedPerConnect = avgSpeed / context.running_task_num
                         if speedPerConnect > maxSpeedPerConnect:
                             maxSpeedPerConnect = speedPerConnect
                             _ = (
@@ -422,129 +394,137 @@ class DownloadTask(QThread):
                                 0.85 * maxSpeedPerConnect * additionalTaskNum
                             ) + formerAvgSpeed
 
-                            if len(self.tasks) < 253:
+                            if context.running_task_num < 253:
                                 for i in range(4):
-                                    self.__reassignWorker()  # 新增线程
+                                    self.__reassignWorker(context)  # 新增线程
 
                 await asyncio.sleep(1)
-        else:
-            while (
-                not self.ableToParallelDownload
-            ):  # 实际上此时 self.ableToParallelDownload 用于记录任务是否完成
-                self.progress = 0
 
-                for i in self.workers:
-                    self.progress += i.progress - i.startPos + 1
+    async def __supervisorSingleThread(self):
+        while (
+            not self.ableToParallelDownload
+        ):  # 实际上此时 self.ableToParallelDownload 用于记录任务是否完成
+            self.progress = 0
 
-                self.workerInfoChanged.emit([])
+            self.workerInfoChanged.emit([])
 
-                # 计算速度
-                speed = self.progress - LastProgress
-                LastProgress = self.progress
-                self.historySpeed.pop(0)
-                self.historySpeed.append(speed)
-                avgSpeed = sum(self.historySpeed) / 10
+            # 计算速度
+            speed = self.progress - LastProgress
+            LastProgress = self.progress
+            self.historySpeed.pop(0)
+            self.historySpeed.append(speed)
+            avgSpeed = sum(self.historySpeed) / 10
 
-                self.speedChanged.emit(avgSpeed)
+            self.speedChanged.emit(avgSpeed)
 
-                await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
     async def __main(self):
         try:
             # 打开下载文件
+            
+            firstWorkerResponse = await self.get_first_worker_response()
             self.file = open(f"{self.filePath}/{self.fileName}", "rb+")
+            self.__initTask(firstWorkerResponse)
 
             if self.ableToParallelDownload:
-                for i in self.workers:  # 启动 Worker
-                    _ = asyncio.create_task(self.__handleWorker(i))
+                #多线程部分
+                # 加载分块
+                context = MutiThreadContext(self.fileSize)
 
-                    self.tasks.append(_)
+                self.__loadWorkers(context)
 
-                self.ghdFile = open(f"{self.filePath}/{self.fileName}.ghd", "wb")
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.__supervisor(context))
+                    for i in context.workers:  # 启动 Worker
+                        tg.create_task(self.__handleWorker(i, context))
 
+                    self.ghdFile = open(f"{self.filePath}/{self.fileName}.ghd", "wb")
+                    await self.__handleFirstWorker()#todo
             else:
+
+                #单线程部分
                 logger.debug(f"Task {self.fileName}, starting single thread...")
-                _ = asyncio.create_task(
-                    self.__handleWorkerWhenUnableToParallelDownload(self.workers[0])
-                )
-                self.tasks.append(_)
-
-            self.supervisorTask = asyncio.create_task(self.__supervisor())
-            # 仅仅需要等待 supervisorTask
-            try:
-                await self.supervisorTask
-            except asyncio.CancelledError:
-                await self.client.close()
-
-            # 关闭
-            await self.client.close()
-
-            self.file.close()
-
-            if self.fileSize:  # 事实上表示 ableToParallelDownload 为 False
-                self.ghdFile.close()
-            else:
-                logger.info(f"Task {self.fileName} finished!")
-                self.taskFinished.emit()
-
-            if self.progress == self.fileSize:
-                # 下载完成时删除历史记录文件, 防止没下载完时误删
+                singleWorker = DownloadWorker(0, 0, self.fileSize, self.client)
+                superviewer = asyncio.create_task(self.__supervisorSingleThread())
                 try:
-                    Path(f"{self.filePath}/{self.fileName}.ghd").unlink()
+                    await self.__handleFirstWorker(singleWorker)  # todo
+                finally:
+                    superviewer.cancel()
 
-                except Exception as e:
-                    logger.error(
-                        f"Failed to delete the history file, please delete it manually. Err: {e}"
-                    )
-
-                logger.info(f"Task {self.fileName} finished!")
-
-                self.taskFinished.emit()
+            
+            
 
         except Exception as e:
             self.gotWrong.emit(repr(e))
 
-    def stop(self):
-        for task in self.tasks:
-            task.cancel()
-
-        # 关闭
-        try:
-            self.supervisorTask.cancel()
-        finally:
-
-            def _stop():
-                self.file.close()
+        finally:  # 关闭
+            self.client.close()
+            self.file.close()
+            if self.fileSize:
                 self.ghdFile.close()
+            else:
+                logger.info(f"Task {self.fileName} finished!")
+                self.taskFinished.emit()
+            
+            if self.progress == self.fileSize:
+                try:
+                    Path(f"{self.filePath}/{self.fileName}.ghd").unlink()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to delete the history file, please delete it manually. Err: {e}"
+                    )
+                logger.info(f"Task {self.fileName} finished!")
+                self.taskFinished.emit()
 
-                while not all(task.done() for task in self.tasks):  # 等待所有任务完成
-                    for task in self.tasks:
-                        try:
-                            task.cancel()
-                        except RuntimeError:
-                            pass
-                        except Exception as e:
-                            raise e
 
-                    time.sleep(0.05)
-
-            Thread(target=_stop, daemon=True).start()
+    def stop(self):
+        # 关闭
+        self._mainTask.cancel()
 
     # @retry(3, 0.1)
     def run(self):
-        self.__initThread.join()
 
-        # 加载分块
-        self.__loadWorkers()
+        
 
         # 主逻辑, 使用事件循环启动异步任务
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-
+        
         try:
+            self._mainTask = self.loop.create_task(self.__main())
             self.loop.run_until_complete(self.__main())
         except asyncio.CancelledError as e:
             print(e)
         finally:
             self.loop.run_until_complete(self.loop.shutdown_asyncgens())
             self.loop.close()
+    
+    async def get_first_worker_response(self):
+        headers = self.headers.copy()
+        headers["range"] = "bytes=0-"
+        rsp = await self.client.request(method="GET", url=self.url, headers=self.headers, timeout=30, stream=True)
+        try:
+            rsp.raise_for_status()
+            if rsp.status_code == 206:
+                self.ableToParallelDownload = True        #todo: getlinkinfo
+                self.inited.set()
+            else:
+                self.ableToParallelDownload = False
+                self.inited.set()
+            self.__initTask()
+
+            
+
+    async def get_partical_response(self, worker: DownloadWorker):
+        headers = self.headers.copy()
+        headers["range"] = f"bytes={worker.startPos}-{worker.endPos}"
+        rsp = await self.client.request(method="GET", url=self.url, headers=self.headers, timeout=30, stream=True)
+        return rsp
+        # try:
+        #     rsp.raise_for_status()
+        #     yield rsp
+        # except:
+        #     await rsp.aclose()
+    async def foo(self):
+        await asyncio.create_task(self.bar())
